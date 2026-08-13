@@ -1,0 +1,8 @@
+ParserProtobufLogs/
+*.csv
+dataset/
+*.png
+*.txt
+.venv/
+venv/
+pyrightconfig.json
