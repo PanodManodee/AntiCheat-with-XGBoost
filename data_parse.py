@@ -120,6 +120,9 @@ def parse(file):
     df["file"] = file.name
 
     df = flatten_all(df)
+    df.to_csv(
+        f"parsed_files/parse_{file.parents[2].name}_{file.parents[1].name}", index=False
+    )
 
     return df
 
@@ -129,8 +132,7 @@ if __name__ == "__main__":
     print(f"Found {len(files)} .bin files")
     with mp.Pool(processes=4) as pool:
         results = pool.map(parse, files)
-    df_all = pd.concat(results, ignore_index=True)
-
+"""
     # datetime -> unix timestamp (seconds) so XGBoost can use it as a numeric feature
     for col in df_all.select_dtypes(include="datetime64[us, UTC]").columns:
         df_all[col] = df_all[col].astype("int64") // 10**9
@@ -138,6 +140,4 @@ if __name__ == "__main__":
     # str -> category (train with xgb.XGBClassifier(enable_categorical=True, tree_method="hist"))
     for col in df_all.select_dtypes(include="str").columns:
         df_all[col] = df_all[col].astype("category")
-
-    print(df_all.info())
-    df_all.to_csv("parsed_all_packets_server.csv", index=False)
+"""

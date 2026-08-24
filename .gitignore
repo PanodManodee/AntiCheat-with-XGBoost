@@ -6,3 +6,4 @@ dataset/
 .venv/
 venv/
 pyrightconfig.json
+parsed_files/
