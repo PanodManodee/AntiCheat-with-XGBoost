@@ -1,0 +1,58 @@
+========================================================================================================================
+========================================================================================================================
+
+CATEGORICAL COLUMNS
+
+	Current members: incoming, event_type, header.ids.sessionid, new_player.update_ip_port, weapon.ot, 
+		weapon.target_id, weapon.bone, weapon.blind, weapon.weapon, weapon.cartridge_id, 
+		phase_event.phase_name, phase_event.start, new_player.name
+
+	Currently, the way they are encoded is as follows:
+		- In aggregate_window (section 5), "agg[col] = window_df[col].iloc[-1]" selects each column's last value 
+		from a window.
+		- The previous function is used in the build_dataset (section 7)
+		- In encode_feature (section 8), the features are one-hot encoded
+
+	This means that each window will contain one-hot encoded features, each has only the last occurrence of it 
+	e.g. if the last entry of the weapon.target_id column is 4, then the window will only contain 
+	weapon.target_id_4.0 = 1 (only the target id 4 will be encoded)
+
+	NOTE: By design, other players' aggregation will not have any of these features represented at all.
+
+	PROBLEM: This method is useless for us. We (if possible) want to track ALL occurrence of the categorical columns 		in each window (e.g. exactly who were shot each window), not just the last one.
+
+		We need to modify the code to fit the above requirement.
+
+========================================================================================================================
+========================================================================================================================
+
+TARGETS & LABELS
+
+	Currently, if a window contains a cheat event, it will be included in the labels. However, each cheat lasts 10 
+seconds. The effect of the cheat may "leaked" into the next window and get picked up. The model will evaluate this as a
+false positive, even though the answer is actually correct. This was discussed before, but this model has yet to solve this issue. 
+
+This issue is unavoidable and may proved to be our greatest hurdle in the future.
+
+========================================================================================================================
+========================================================================================================================
+
+OTHERS
+
+	Feature Correlation: Many features still have almost 1 or -1 correlation which needs to be resolved
+
+	CONFIG section: Double check to se if all columns are correctly in place and whether or not you agree 
+	with its placements (e.g. should bunches_count be in ONE_HOT_COLS instead of NUMERIC_FEATURE_COLS) 
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,175 @@
+BRIEF WALKTHROUGH
+
+This code tries to process the server-side data to work with XGBoost properly.
+
+XGBoost is a type of gradient boosted decision tree. It creates a strong decision tree by improving the 
+previous tree over and over again. (Search "decision tree" images in Google). Since we're focusing on the features, 
+JUST TREAT XGBOOST AS A DECISION TREE
+
+Decision trees train on sets of discrete (not continuous) datapoints, each datapoints contain an input vector and a label
+(like normal Neural Network)
+
+Our data is a time-series data, as such, we need the model to process multiple datapoints (in this case, rows) at once. A 
+decision tree can't do that. It can't look ahead or behind. And, it doesn't hold any memories.
+
+Current Solution: 
+
+	- Use a sliding window. Aggregate (collect) all data within, say, a 20 second interval. Then make a summary of 
+	the data you aggregated. This summarized data, which we will now call window, becomes a datapoint for the 
+	XGBoost. 
+
+	- Since there could be multiple cheats within a window, we'll encode the target with multi-label (e.g. this 	
+	window contains [Aimbot, Wallhack, LagSwitch]). This setup is still not complete. 
+
+WARNING: I CAN NOT GUARANTEE THAT EVERY ASPECT OF THIS MODEL WILL FUNCTION AS INTENDED
+
+
+
+
+
+
+
+
+========================================================================================================================
+CONFIG
+========================================================================================================================
+
+Most of them are columns in the .csv file. 
+Window seconds: How much time each window covers
+Stride seconds: How far will the next window jumps from the previous one.
+
+
+========================================================================================================================
+Section 1. Timestamp handling & Actor column
+========================================================================================================================
+
+prepare_time: Turns time stamp into a useable value. We need it to create the sliding window
+
+resolve_packet_actors: Packet rows use their own ID to refer to a clients IP port addr. This function maps a given ID to 
+	its corresponding IP port
+
+add_actor_column: Event rows also use their own separate ID. Also, each event type has its own dedicated player_id 
+	column. This functions combined all of them and maps a given ID to its corresponding IP port
+
+The 2 latter functions helps the XGBoost correctly identify who is who.
+
+
+========================================================================================================================
+Section 2. Resolve cheat events -> (game_id, timestamp, ip_port, exploit_type)
+========================================================================================================================
+
+Builds a DataFrame (think of it as a table) that contains all the cheat events in the data. 
+Each entry contains:
+	- the Match it occurred in (if we use multiple matches)
+	- timestamp
+	- the cheater
+	- the cheat type
+
+
+========================================================================================================================
+Section 3. Create a cheat type vocabulary
+========================================================================================================================
+
+Contains all cheat types found in the data. So that we don't have to hard code them in. Also provides flexibility.
+
+
+========================================================================================================================
+Section 4. Time-based windows, built per game, including empty windows
+========================================================================================================================
+
+make_time_windows: It's in the name. You know what it does
+
+
+========================================================================================================================
+Section 4b. Aggregate Sequence & ACKed sequence
+========================================================================================================================
+
+aggregate_monotonic_counters: Unlike usual numerical features (see Section 5), sequence & ACKed sequence will only 
+	increases as time goes on. So we calculate its:
+		- rate of increase per second
+		- delta
+		- regression count (how many times it decreases)
+
+
+========================================================================================================================
+Section 5. Window aggregation -> one row of X (handles empty windows)
+========================================================================================================================
+
+Aggregates the "normal" features
+
+We find these values from each numerical columns:
+	- Its mean
+	- Its standard deviation
+	- Its max value
+	- Its min value
+	- Its last value <====== this might be useless. you can try removing it
+
+For the categorical columns, read the "To_be_fixed.txt"
+
+========================================================================================================================
+Section 6. Target: cheat types THIS SPECIFIC PLAYER committed in this window
+========================================================================================================================
+
+
+
+
+
+========================================================================================================================
+Section 6b. "Others" context:
+========================================================================================================================
+
+Further summarizes other players' telemetry to detect cheats that affect other people (like network attacks)
+
+Each aggregated numerical features are used to calculate:
+	- mean
+	- max
+	- sum
+
+========================================================================================================================
+Section 7. Build the full dataset
+========================================================================================================================
+
+Combined the prior functions to create the dataset
+
+Each row represents each window of each player and includes the player's features and others' features
+
+
+========================================================================================================================
+Section 8. Feature encoding:
+========================================================================================================================
+
+Drops the unwanted columns
+
+One-Hot encodes the categorical columns (read To_be_fixed.txt)
+
+========================================================================================================================
+Section 9. Target Encoding & Output related functions
+========================================================================================================================
+
+
+
+
+
+========================================================================================================================
+Section 10. The XGBoost itself
+========================================================================================================================
+
+
+
+
+
+========================================================================================================================
+Section 11. Ignore it
+========================================================================================================================
+
+
+
+
+
+
+========================================================================================================================
+Section 12. Feature diagnostics: correlation, importance, mutual information 
+========================================================================================================================
+
+
+
