@@ -10,3 +10,10 @@ parsed_files/
 *.7z
 /UE5_python_client
 /__pycache__
+/UE5_python_dependencies/__pycache__
+/UE5_python_dependencies/net/__pycache__
+/UE5_python_dependencies/net/handlers/__pycache__
+/UE5_python_dependencies/serialization/__pycache__
+/UE5_python_dependencies/net/__pycache__
+/UE5_python_dependencies/net/handlers/__pycache__
+/UE5_python_dependencies/serialization/__pycache__

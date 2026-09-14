@@ -11,7 +11,6 @@ and per-bunch/channel payload together with standard packet metadata.
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from pathlib import Path
 
@@ -20,9 +19,6 @@ from scapy.all import PcapReader
 from scapy.layers.inet import IP, UDP
 
 BASE_DIR = Path(__file__).resolve().parent
-CLIENT_DIR = BASE_DIR / "UE5_python_client" / "client"
-if str(CLIENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CLIENT_DIR))
 
 from UE5_python_dependencies.serialization.bit_reader import FBitReader, BitReaderError
 from UE5_python_dependencies.serialization.bit_util import FBitUtil
