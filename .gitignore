@@ -9,3 +9,4 @@ pyrightconfig.json
 parsed_files/
 *.7z
 /UE5_python_client
+/__pycache__
