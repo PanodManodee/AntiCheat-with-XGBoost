@@ -1,49 +1,46 @@
 #!/usr/bin/env python3
-"""Map pcap packet fields onto the .bin-derived ground-truth CSV.
+"""Map pcap packet fields onto the server ground truth shipped in the dataset.
 
-For each input pcap:
-  1. decode the UDP payloads with ``PcapAdaptor`` (pcap_adaptor.py), reusing the
-     UE5 network implementation (FBitReader / StatelessConnect / packet + bunch
-     headers);
-  2. auto-locate the matching ground truth in ``parsed_all_packets.csv`` from the
-     pcap path (``capture_server_<ts>.pcap`` -> ``trace_server_<ts>.bin``,
-     resolved within the same session/match directory);
-  3. join every wire packet to its ground-truth row by seq, acked_seq or nearest
-     timestamp (within a configurable window);
-  4. write one merged packet CSV + a lean bunch CSV + an event-label CSV.
+For each input pcap (``dataset/<Session>/<Match>/Server/capture_server_<ts>.pcap``):
 
-Field pairs that exist on both sides are kept under explicit prefixes
-(``wire_*`` for the pcap decoder, ``bin_*`` for the ground truth) so they can be
-cross-checked without column-name collisions; genuinely duplicated columns
-(payload hex, raw coordinates blocks, ``header.ids.hash_data`` vs ``hash_data``,
-bin ``timestamp`` vs ``ts``, etc.) are dropped from the output.
+  1. decode the UDP payloads with ``PcapAdaptor`` (pcap_adaptor.py), reusing
+     the UE5 network implementation (handler prefix, packet header, packet
+     info, bunch headers);
+  2. load the sibling ground truth ``trace_server_<ts>.bin`` (or ``.csv``)
+     with ``truth_loader`` - no global CSV needed;
+  3. resolve every client ``ip:port`` to the truth address id and player id
+     (``new_address`` / ``new_player`` events);
+  4. join each wire packet to its truth packet row by (client, direction, seq),
+     falling back to the nearest unused row of the same client/direction in
+     time;
+  5. label each packet with the cheats its player is running (and cheats
+     aimed at that player) from the start/stop cheat events;
+  6. write ``<out>.csv`` (packets), ``<out>_bunches.csv`` (wire bunches) and
+     ``<out>_events.csv`` (truth events with resolved actor + cheat label).
 
-Ground truth is streamed in chunks and only rows belonging to the needed bins are
-retained, so peak memory stays proportional to the matched subset rather than the
-full 1.9 GB CSV.
+Column prefixes: ``wire_*`` comes from the pcap decoder, ``bin_*`` from the
+ground truth. Note on ``acked_seq``: for server->client packets
+``wire_acked_seq`` is the header's AckedSeq (the last *client* seq the server
+received); the truth's ``bin_notif_acked_seq`` on outgoing rows is the
+server's own last-acked out-seq, so the two legitimately differ on ``sc``.
 
 Usage:
     parse_pcap.py <pcap file(s)|directory|glob> [--output FILE]
+                  [--truth-source auto|bin|csv] [--truth TRACE]
 """
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 import time
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scapy.all import PcapReader
-from scapy.layers.inet import IP, UDP
 
-import pcap_adaptor
 from pcap_adaptor import PcapAdaptor, discover_files
+from truth_loader import BUNCH_FEATURE_COLS, find_truth, load_truth
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_TRUTH = BASE_DIR / "parsed_all_packets.csv"
 DEFAULT_OUTPUT = "pcap_mapped.csv"
 DEFAULT_SERVER_PORT = 7777
 
@@ -51,80 +48,7 @@ DEFAULT_SERVER_PORT = 7777
 # Schemas
 # ----------------------------------------------------------------------------
 
-# Ground-truth columns we actually need. Every name here exists in
-# parsed_all_packets.csv (the flattened .bin). They are renamed to ``bin_*``.
-TRUTH_READ_COLS = [
-    "file", "session", "match", "ts", "ind", "frame", "outgoing", "incoming",
-    "hash_data", "entry_type", "event_type",
-    "header.ids.sessionid", "header.ids.clientid", "header.ids.ipaddress",
-    "notification.type", "notification.seq", "notification.acked_seq",
-    "notification.extra_info_header.type",
-    "notification.extra_info_header.jitter_clock",
-    "phase_event.phase_name", "phase_event.start",
-    "health.player_id", "health.old", "health.new_",
-    "movement.player_id", "movement.dS", "movement.ts_client",
-    "movement.new_location", "movement.new_rotation",
-    "weapon.player_id", "weapon.ot", "weapon.time", "weapon.dist",
-    "weapon.target_id", "weapon.bone", "weapon.blind", "weapon.weapon",
-    "weapon.visible_players", "weapon.cartridge_id",
-    "cheat.cheater_id", "cheat.target_id", "cheat.type", "cheat.start",
-    "cheat.dur", "cheat.out", "cheat.in_",
-    "header.handshake.packet_type", "header.handshake.sent_packet_count",
-    "header.handshake.restart", "header.handshake.secretid",
-    "header.handshake.ts", "header.handshake.cookie",
-]
-TRUTH_RENAME = {
-    "file": "bin_file", "ts": "bin_ts", "ind": "bin_ind", "frame": "bin_frame",
-    "outgoing": "bin_outgoing", "incoming": "bin_incoming",
-    "hash_data": "bin_hash_data",
-    "entry_type": "bin_entry_type", "event_type": "bin_event_type",
-    "session": "bin_session", "match": "bin_match",
-    "header.ids.sessionid": "bin_sessionid",
-    "header.ids.clientid": "bin_clientid",
-    "header.ids.ipaddress": "bin_ipaddress",
-    "notification.type": "bin_notif_type",
-    "notification.seq": "bin_notif_seq",
-    "notification.acked_seq": "bin_notif_acked_seq",
-    "notification.extra_info_header.type": "bin_extra_info_type",
-    "notification.extra_info_header.jitter_clock": "bin_jitter_clock",
-    "phase_event.phase_name": "bin_phase_name",
-    "phase_event.start": "bin_phase_start",
-    "health.player_id": "bin_health_player_id",
-    "health.old": "bin_health_old",
-    "health.new_": "bin_health_new",
-    "movement.player_id": "bin_movement_player_id",
-    "movement.dS": "bin_movement_dS",
-    "movement.ts_client": "bin_movement_ts_client",
-    "movement.new_location": "bin_movement_loc",
-    "movement.new_rotation": "bin_movement_rot",
-    "weapon.player_id": "bin_weapon_player_id",
-    "weapon.ot": "bin_weapon_ot",
-    "weapon.time": "bin_weapon_time",
-    "weapon.dist": "bin_weapon_dist",
-    "weapon.target_id": "bin_weapon_target_id",
-    "weapon.bone": "bin_weapon_bone",
-    "weapon.blind": "bin_weapon_blind",
-    "weapon.weapon": "bin_weapon_weapon",
-    "weapon.visible_players": "bin_weapon_visible_players",
-    "weapon.cartridge_id": "bin_weapon_cartridge_id",
-    "cheat.cheater_id": "bin_cheat_cheater_id",
-    "cheat.target_id": "bin_cheat_target_id",
-    "cheat.type": "bin_cheat_type",
-    "cheat.start": "bin_cheat_start",
-    "cheat.dur": "bin_cheat_dur",
-    "cheat.out": "bin_cheat_out",
-    "cheat.in_": "bin_cheat_in",
-    "header.handshake.packet_type": "bin_handshake_packet_type",
-    "header.handshake.sent_packet_count": "bin_handshake_sent_packet_count",
-    "header.handshake.restart": "bin_handshake_restart",
-    "header.handshake.secretid": "bin_handshake_secretid",
-    "header.handshake.ts": "bin_handshake_ts",
-    "header.handshake.cookie": "bin_handshake_cookie",
-}
-TRUTH_OUT_COLS = list(TRUTH_RENAME.values())
-
-# Wire ("adaptor") columns exposed in the merged output, renamed ``wire_*`` so
-# they never collide with the ground-truth columns.
+# Wire ("adaptor") columns exposed in the merged output.
 WIRE_DEF = {
     "file": "file",                 # pcap basename
     "packet_no": "packet_no",
@@ -132,6 +56,7 @@ WIRE_DEF = {
     "flow": "flow",
     "client_ip": "client_ip",
     "client_port": "client_port",
+    "packet_length": "packet_length",
     "payload_len": "payload_len",
     "is_handshake": "wire_is_handshake",
     "packet_type": "wire_packet_type",
@@ -148,6 +73,7 @@ WIRE_DEF = {
     "cached_client_id": "wire_cached_client_id",
     "seq": "wire_seq",
     "acked_seq": "wire_acked_seq",
+    "history_word_count": "wire_history_word_count",
     "has_packet_info": "wire_has_packet_info",
     "jitter_clock_ms": "wire_jitter_ms",
     "has_server_frame_time": "wire_has_server_frame_time",
@@ -160,50 +86,105 @@ WIRE_DEF = {
 }
 WIRE_OUT_COLS = list(WIRE_DEF.values())
 
-PACKET_OUT_COLS = WIRE_OUT_COLS + TRUTH_OUT_COLS + [
-    "join_method", "join_delta_ms",
-]
+# Truth packet-row columns (dotted truth name -> output name).
+PKT_TRUTH_RENAME = {
+    "file": "bin_file", "session": "bin_session", "match": "bin_match",
+    "ts": "bin_ts", "ind": "bin_ind", "frame": "bin_frame",
+    "outgoing": "bin_outgoing", "incoming": "bin_incoming",
+    "hash_data": "bin_hash_data",
+    "header.ids.sessionid": "bin_sessionid",
+    "header.ids.clientid": "bin_clientid",
+    "header.ids.ipaddress": "bin_ipaddress",
+    "notification.type": "bin_notif_type",
+    "notification.seq": "bin_notif_seq",
+    "notification.acked_seq": "bin_notif_acked_seq",
+    "_addr": "bin_client_addr",
+    "notification.extra_info_header.type": "bin_extra_info_type",
+    "notification.extra_info_header.jitter_clock": "bin_jitter_clock",
+    **{c: c for c in BUNCH_FEATURE_COLS},
+}
+PKT_TRUTH_OUT_COLS = list(PKT_TRUTH_RENAME.values())
 
-# Lean bunch-level output: parent packet context + join meta + wire bunch fields
-# (the flags/sequence per channel that the flat packet rows cannot carry).
+IDENTITY_COLS = ["client_addr", "address_id", "player_id", "player_name",
+                 "player_map_method"]
+LABEL_COLS = ["cheat_active", "cheat_types", "cheat_target_active",
+              "cheat_target_types"]
+
+PACKET_OUT_COLS = (
+    WIRE_OUT_COLS + IDENTITY_COLS + LABEL_COLS + PKT_TRUTH_OUT_COLS
+    + ["wire_bin_bunch_count_diff", "join_method", "join_delta_ms"]
+)
+
+# Bunch-level output: parent packet context + wire bunch fields.
 BUNCH_PKT_COLS = [
     "file", "packet_no", "timestamp", "flow", "client_ip", "client_port",
+    "client_addr", "player_id", "cheat_active", "cheat_types",
     "payload_len", "wire_seq", "wire_acked_seq", "wire_is_handshake",
     "wire_channels", "wire_bunch_parse_error",
-    "join_method", "join_delta_ms",
-    "bin_file", "bin_ts", "bin_outgoing", "bin_incoming", "bin_entry_type",
-    "bin_event_type", "bin_notif_seq",
+    "join_method", "join_delta_ms", "bin_file", "bin_ts", "bin_notif_seq",
 ]
 BUNCH_FIELD_COLS = [
-    "bunch_no", "ch_index", "ch_name", "reliable", "open", "close", "partial",
-    "partial_initial", "partial_final", "ch_sequence",
+    "bunch_no", "ch_index", "ch_name", "reliable", "open", "close",
+    "close_reason", "is_replication_paused", "partial", "partial_initial",
+    "partial_final", "partial_custom_exports_final", "ch_sequence",
     "has_package_map_exports", "has_must_be_mapped_guids", "payload_bits",
 ]
 BUNCH_OUT_COLS = BUNCH_PKT_COLS + BUNCH_FIELD_COLS
-
 BUNCH_RENAME = {
     "seq": "wire_seq", "acked_seq": "wire_acked_seq",
     "is_handshake": "wire_is_handshake", "channels": "wire_channels",
     "bunch_parse_error": "wire_bunch_parse_error",
 }
 
-# Ground-truth event rows (movement/weapon/health/cheat/phase) are stored as
-# separate entries with their own timestamp. They are emitted to a companion
-# *_events.csv so the cheat/weapon/movement labels can be joined to packets by
-# time (event.ts ~ packet.bin_ts).
-EVENT_OUT_COLS = [
-    "bin_file", "bin_ts", "bin_ind", "bin_frame", "bin_entry_type", "bin_event_type",
-    "bin_sessionid", "bin_clientid",
-    "bin_phase_name", "bin_phase_start",
-    "bin_health_player_id", "bin_health_old", "bin_health_new",
-    "bin_movement_player_id", "bin_movement_dS", "bin_movement_ts_client",
-    "bin_movement_loc", "bin_movement_rot",
-    "bin_weapon_player_id", "bin_weapon_ot", "bin_weapon_time", "bin_weapon_dist",
-    "bin_weapon_target_id", "bin_weapon_bone", "bin_weapon_blind", "bin_weapon_weapon",
-    "bin_weapon_visible_players", "bin_weapon_cartridge_id",
-    "bin_cheat_cheater_id", "bin_cheat_target_id", "bin_cheat_type", "bin_cheat_start",
-    "bin_cheat_dur", "bin_cheat_out", "bin_cheat_in",
-]
+# Truth event columns (dotted -> output). List-valued fields are expanded in
+# ``extract_events``.
+EVENT_RENAME = {
+    "file": "bin_file", "session": "bin_session", "match": "bin_match",
+    "ts": "bin_ts", "ind": "bin_ind", "frame": "bin_frame",
+    "event_type": "bin_event_type",
+    "new_address.address_id": "bin_new_address_id",
+    "new_address.ip": "bin_new_address_ip",
+    "new_player.player_id": "bin_new_player_id",
+    "new_player.name": "bin_new_player_name",
+    "new_player.ip_port": "bin_new_player_ip_port",
+    "new_player.update_ip_port": "bin_new_player_update_ip_port",
+    "phase_event.phase_name": "bin_phase_name",
+    "phase_event.start": "bin_phase_start",
+    "health.player_id": "bin_health_player_id",
+    "health.old": "bin_health_old",
+    "health.new_": "bin_health_new",
+    "movement.player_id": "bin_movement_player_id",
+    "movement.dS": "bin_movement_dS",
+    "movement.ts_client": "bin_movement_ts_client",
+    "weapon.player_id": "bin_weapon_player_id",
+    "weapon.ot": "bin_weapon_ot",
+    "weapon.time": "bin_weapon_time",
+    "weapon.dist": "bin_weapon_dist",
+    "weapon.target_id": "bin_weapon_target_id",
+    "weapon.bone": "bin_weapon_bone",
+    "weapon.blind": "bin_weapon_blind",
+    "weapon.weapon": "bin_weapon_weapon",
+    "weapon.cartridge_id": "bin_weapon_cartridge_id",
+    "cheat.cheater_id": "bin_cheat_cheater_id",
+    "cheat.target_id": "bin_cheat_target_id",
+    "cheat.type": "bin_cheat_type",
+    "cheat.start": "bin_cheat_start",
+    "cheat.dur": "bin_cheat_dur",
+    "cheat.out": "bin_cheat_out",
+    "cheat.in_": "bin_cheat_in",
+}
+EVENT_OUT_COLS = (
+    list(EVENT_RENAME.values())
+    + ["bin_movement_loc_x", "bin_movement_loc_y", "bin_movement_loc_z",
+       "bin_movement_rot", "bin_weapon_visible_players",
+       "bin_weapon_visible_count",
+       "actor_player_id", "actor_name", "actor_addr"]
+    + LABEL_COLS
+)
+
+# Player-id columns per event type (first non-null wins).
+ACTOR_COLS = ["health.player_id", "movement.player_id", "weapon.player_id",
+              "cheat.cheater_id", "new_player.player_id"]
 
 
 def _canonicalize(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -215,334 +196,391 @@ def _canonicalize(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return df[columns].astype(object).fillna("")
 
 
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    return df[name] if name in df.columns else pd.Series(np.nan, index=df.index)
+
+
+def _truthy(s: pd.Series) -> np.ndarray:
+    """True for True / 'True' / 1; False for False / NaN / ''."""
+    return s.map(lambda v: v is True or v == 1 or str(v).strip().lower() == "true"
+                 ).to_numpy(dtype=bool)
+
+
 # ----------------------------------------------------------------------------
-# Ground-truth loading (memory-safe, chunked)
+# Identity: ip:port <-> address id <-> player id
 # ----------------------------------------------------------------------------
 
-def bin_key_from_pcap(pcap_path: Path) -> str | None:
-    """capture_server_<ts>.pcap -> trace_server_<ts>.bin (or None if no match)."""
-    m = re.match(r"^capture_(.+\.pcap(?:ng)?)$", pcap_path.name, re.IGNORECASE)
-    if not m:
-        return None
-    stem = re.sub(r"\.pcap(?:ng)?$", ".bin", m.group(1), flags=re.IGNORECASE)
-    return "trace_" + stem
+class Identity:
+    """Client identity resolved from the truth ``new_address``/``new_player``
+    events. Player registrations are time-aware: the latest registration of
+    an ``ip:port`` at (or, if none yet, after) a given time wins."""
 
+    def __init__(self, truth: pd.DataFrame):
+        ev = truth[truth["entry_type"] == "event"]
+        na = ev[ev["event_type"] == "new_address"]
+        self.addr_by_id: dict[int, str] = {}
+        for a, ip in zip(_col(na, "new_address.address_id"), _col(na, "new_address.ip")):
+            if pd.notna(a) and isinstance(ip, str) and ip:
+                self.addr_by_id[int(a)] = ip
+        self.id_by_addr = {ip: a for a, ip in self.addr_by_id.items()}
 
-def _norm_name(name: str) -> str:
-    """Normalise a bin/trace filename to compare timestamps regardless of
-    -, _ or 'merged' suffixes (e.g. trace_server_2026.02.20_15.36.45_merged.bin)."""
-    return re.sub(r"[^0-9:.]", "", name)
+        npl = ev[ev["event_type"] == "new_player"]
+        reg = pd.DataFrame({
+            "t": npl["_ts_epoch"].to_numpy(dtype="float64"),
+            "pid": pd.to_numeric(_col(npl, "new_player.player_id"), errors="coerce"),
+            "name": _col(npl, "new_player.name"),
+            "addr": _col(npl, "new_player.ip_port"),
+        }).dropna(subset=["pid"]).sort_values("t", kind="stable")
+        self.names = {int(p): n for p, n in zip(reg["pid"], reg["name"])
+                      if isinstance(n, str) and n}
+        self.reg = reg[reg["addr"].map(lambda a: isinstance(a, str) and ":" in a)]
+        self.reg = self.reg.assign(ip=self.reg["addr"].str.rsplit(":", n=1).str[0])
 
+    def truth_addr(self, tp: pd.DataFrame) -> pd.Series:
+        """Client ip:port of truth packet rows."""
+        by_id = pd.to_numeric(_col(tp, "header.ids.ipaddress"), errors="coerce").map(
+            lambda a: self.addr_by_id.get(int(a)) if pd.notna(a) else np.nan)
+        direct = _col(tp, "notification.address")
+        return direct.where(direct.notna(), by_id)
 
-def index_truth(truth_path: Path) -> tuple[pd.DataFrame, list[str]]:
-    """One-column pass listing distinct (file, session, match) values cheaply.
-
-    Returns (DataFrame, run_order) where run_order is the first-appearance
-    (contiguous-run) order of the bin files in the CSV.
-    """
-    seen: dict[str, tuple[str, str]] = {}
-    order: list[str] = []
-    t0 = time.monotonic()
-    for i, chunk in enumerate(
-        pd.read_csv(truth_path, usecols=["file", "session", "match"], chunksize=500_000)
-    ):
-        for f, s, m in zip(chunk["file"], chunk["session"], chunk["match"]):
-            if f not in seen:
-                seen[f] = (s, m)
-                order.append(f)
-        if i and i % 10 == 0:
-            print(f"  index pass chunk {i*500_000:,} rows in {time.monotonic()-t0:.0f}s", flush=True)
-    idx = pd.DataFrame(
-        [{"file": f, "session": s, "match": m} for f, (s, m) in seen.items()]
-    )
-    print(f"  index pass done: {len(idx)} distinct bins in {time.monotonic()-t0:.0f}s")
-    return idx, order
-
-
-def resolve_truth_files(pcaps: list[Path], index: pd.DataFrame) -> dict[str, str]:
-    """Map each pcap to the best ground-truth 'file' value (exact name, else
-    timestamp-normalised match constrained to the same session/match)."""
-    resolution: dict[str, str] = {}
-    by_norm = index.copy()
-    by_norm["_norm"] = by_norm["file"].map(_norm_name)
-    for pcap in pcaps:
-        key = bin_key_from_pcap(pcap)
-        if key is None:
-            continue
-        if key in set(index["file"]):
-            resolution[str(pcap)] = key
-            continue
-        session = pcap.parts[-3] if len(pcap.parts) >= 3 else None
-        match = pcap.parts[-2] if len(pcap.parts) >= 2 else None
-        sub = by_norm
-        if session is not None:
-            sub = sub[sub["session"] == session]
-        if match is not None:
-            sub = sub[sub["match"] == match]
-        hits = sub[sub["_norm"] == _norm_name(key)]
-        if hits.empty:
-            hits = sub[sub["_norm"].str.startswith(_norm_name(key).replace(".", ""), na=False)]
-        if not hits.empty:
-            resolution[str(pcap)] = str(hits.sort_values("file").iloc[0]["file"])
-    return resolution
-
-
-def iter_truth_runs(truth_path: Path, needed_files: set[str]):
-    """Stream parsed_all_packets.csv run-by-run (rows are grouped by 'file').
-
-    Yields ``(bin_file, DataFrame)`` for each *needed* contiguous run, so peak
-    memory stays proportional to the largest single bin rather than the union
-    of all needed bins.
-    """
-    t0 = time.monotonic()
-    cur_file: str | None = None
-    cur: list[pd.DataFrame] = []
-    # NOTE: pandas 3.0.3 crashes with `usecols` + `chunksize` on wide tables
-    # (IndexError in c_parser_wrapper). Read the full chunk and slice the needed
-    # columns after selecting the current run. Default dtypes keep numeric
-    # columns as numpy arrays (lighter than per-cell strings).
-    for i, chunk in enumerate(
-        pd.read_csv(
-            truth_path, low_memory=False, keep_default_na=True, chunksize=200_000
-        )
-    ):
-        if i and i % 50 == 0:
-            print(f"  truth pass {i*200_000:,} rows in {time.monotonic()-t0:.0f}s",
-                  flush=True)
-        vals = chunk["file"].to_numpy()
-        if vals.size == 0:
-            continue
-        change = np.flatnonzero(vals[1:] != vals[:-1]) + 1
-        bounds = np.concatenate(([0], change, [vals.size]))
-        for s, e in zip(bounds[:-1], bounds[1:]):
-            f = vals[s]
-            sub = chunk.iloc[s:e][TRUTH_READ_COLS]
-            if f == cur_file:
-                if cur_file in needed_files:
-                    cur.append(sub)
+    def players_for(self, addrs: np.ndarray, t: np.ndarray):
+        """Resolve (addr, time) arrays -> (player_id float array, method array)."""
+        pid = np.full(len(addrs), np.nan)
+        method = np.full(len(addrs), "none", dtype=object)
+        for addr in pd.unique(addrs):
+            mask = addrs == addr
+            exact = self.reg[self.reg["addr"] == addr]
+            if not exact.empty:
+                ts = exact["t"].to_numpy()
+                j = np.clip(np.searchsorted(ts, t[mask], side="right") - 1, 0, len(ts) - 1)
+                pid[mask] = exact["pid"].to_numpy()[j]
+                method[mask] = "exact"
                 continue
-            if cur_file in needed_files and cur:
-                yield cur_file, _finish_run(pd.concat(cur, ignore_index=True))
-            cur_file = f
-            cur = [sub] if f in needed_files else []
-    if cur_file in needed_files and cur:
-        yield cur_file, _finish_run(pd.concat(cur, ignore_index=True))
-    print(f"  truth pass done in {time.monotonic()-t0:.0f}s", flush=True)
+            ip = str(addr).rsplit(":", 1)[0]
+            same_ip = self.reg.loc[self.reg["ip"] == ip, "pid"].unique()
+            if len(same_ip) == 1:
+                pid[mask] = same_ip[0]
+                method[mask] = "ip_only"
+        return pid, method
+
+    def addr_of_player(self, pids: np.ndarray, t: np.ndarray) -> np.ndarray:
+        out = np.full(len(pids), np.nan, dtype=object)
+        for p in pd.unique(pids[~pd.isna(pids)]):
+            regs = self.reg[self.reg["pid"] == p]
+            if regs.empty:
+                continue
+            mask = pids == p
+            ts = regs["t"].to_numpy()
+            j = np.clip(np.searchsorted(ts, t[mask], side="right") - 1, 0, len(ts) - 1)
+            out[mask] = regs["addr"].to_numpy()[j]
+        return out
 
 
-def _finish_run(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename/derive the standard truth columns for one bin's DataFrame."""
-    df = df.rename(columns=TRUTH_RENAME)
-    for c in ("bin_notif_seq", "bin_notif_acked_seq", "bin_jitter_clock"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "bin_ts" in df.columns:
-        ts = pd.to_datetime(df["bin_ts"], utc=True, errors="coerce")
-        df["_bin_ts_epoch"] = _to_epoch_sec(ts)
-    else:
-        df["_bin_ts_epoch"] = np.nan
-    return df
+# ----------------------------------------------------------------------------
+# Cheat labels
+# ----------------------------------------------------------------------------
+
+def cheat_intervals(truth: pd.DataFrame) -> pd.DataFrame:
+    """Pair cheat start/stop events into [start, end] intervals.
+
+    A row with ``start == True`` opens a cheat; the next row for the same
+    (cheater, type) without ``start`` (protobuf drops False) closes it. An
+    unclosed start ends at ``start + dur``; a stop without a start is taken
+    to have begun ``dur`` seconds earlier.
+    """
+    cols = ["cheater_id", "target_id", "type", "start", "end", "how"]
+    ch = truth[(truth["entry_type"] == "event") & (truth["event_type"] == "cheat")]
+    if ch.empty:
+        return pd.DataFrame(columns=cols)
+    ch = ch.sort_values("_ts_epoch", kind="stable")
+    is_start = _truthy(_col(ch, "cheat.start"))
+    opened: dict[tuple, tuple[float, float, float]] = {}
+    rows = []
+    for st, t, cheater, target, kind, dur in zip(
+        is_start, ch["_ts_epoch"], _col(ch, "cheat.cheater_id"),
+        _col(ch, "cheat.target_id"), _col(ch, "cheat.type"), _col(ch, "cheat.dur"),
+    ):
+        dur = float(dur) if pd.notna(dur) else 0.0
+        key = (cheater, kind)
+        if st:
+            if key in opened:  # restarted before stopping
+                s, d, tg = opened.pop(key)
+                rows.append((cheater, tg, kind, s, min(s + d, t), "restart"))
+            opened[key] = (t, dur, target)
+        elif key in opened:
+            s, _, tg = opened.pop(key)
+            rows.append((cheater, tg, kind, s, t, "stop"))
+        else:
+            rows.append((cheater, target, kind, t - dur, t, "stop_only"))
+    for (cheater, kind), (s, d, tg) in opened.items():
+        rows.append((cheater, tg, kind, s, s + d, "dur"))
+    out = pd.DataFrame(rows, columns=cols)
+    for c in ("cheater_id", "target_id"):
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+
+def label_cheats(pid: np.ndarray, t: np.ndarray, iv: pd.DataFrame) -> dict:
+    """Per-row cheat labels for the row's player at time ``t``."""
+    n = len(pid)
+    own = [set() for _ in range(n)] if len(iv) else []
+    tgt = [set() for _ in range(n)] if len(iv) else []
+    for r in iv.itertuples(index=False):
+        in_time = (t >= r.start) & (t <= r.end)
+        for i in np.flatnonzero(in_time & (pid == r.cheater_id)):
+            own[i].add(str(r.type))
+        if pd.notna(r.target_id) and r.target_id > 0:
+            for i in np.flatnonzero(in_time & (pid == r.target_id)):
+                tgt[i].add(str(r.type))
+    if not len(iv):
+        empty = np.full(n, "", dtype=object)
+        return {"cheat_active": np.zeros(n, int), "cheat_types": empty,
+                "cheat_target_active": np.zeros(n, int), "cheat_target_types": empty}
+    return {
+        "cheat_active": np.array([int(bool(s)) for s in own]),
+        "cheat_types": np.array([";".join(sorted(s)) for s in own], dtype=object),
+        "cheat_target_active": np.array([int(bool(s)) for s in tgt]),
+        "cheat_target_types": np.array([";".join(sorted(s)) for s in tgt], dtype=object),
+    }
 
 
 # ----------------------------------------------------------------------------
 # Join
 # ----------------------------------------------------------------------------
 
-def _coerce_float(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce")
+def join_truth(wire: pd.DataFrame, tp: pd.DataFrame, seq_window_s: float,
+               time_window_s: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Match wire rows to truth packet rows.
 
+    ``wire`` needs client_addr/flow/wire_seq/timestamp/wire_is_handshake;
+    ``tp`` (positional index) needs _addr/_flow/notification.seq/_ts_epoch.
 
-def _as_bool(s: pd.Series) -> pd.Series:
-    """Coerce truth flags ('True'/'True'/1/1.0/NaN) into nullable booleans."""
-    num = pd.to_numeric(s, errors="coerce")
-    as_num = num.notna()
-    as_str = s.astype(str).str.strip().str.lower().eq("true").where(~as_num, False)
-    return (num.fillna(0).astype("float64") > 0) | as_str
-
-
-def _to_epoch_sec(ts: pd.Series) -> np.ndarray:
-    """UTC datetime Series -> float seconds since epoch (NaN for NaT)."""
-    ts = ts.copy()
-    if ts.dt.tz is None:
-        ts = ts.dt.tz_localize("UTC")
-    return (ts - pd.Timestamp("1970-01-01", tz="UTC")).dt.total_seconds().to_numpy(dtype="float64")
-
-
-def join_truth(
-    wire: pd.DataFrame, truth: pd.DataFrame, window_s: float
-) -> pd.DataFrame:
-    """Join wire packet rows onto ground-truth rows.
-
-    Priority: exact notification.seq -> exact acked_seq -> nearest timestamp
-    within ``window_s``. Handshake packets are matched by timestamp only.
-    Truth position 0..len(truth)-1 is the global position used for selection.
+    1. handshake packets: method ``handshake`` (the trace logs no handshakes);
+    2. exact (client, direction, seq) within ``seq_window_s`` - nearest in
+       time among unused candidates (seq is 14-bit and wraps);
+    3. nearest unused truth row of the same client+direction within
+       ``time_window_s``.
+    Returns (truth_pos (-1 = none), method, delta_ms) aligned to ``wire``.
     """
-    wire = wire.copy()
-    for c in ("wire_seq", "wire_acked_seq", "timestamp"):
-        if c in wire.columns:
-            wire[c] = _coerce_float(wire[c])
+    m = len(wire)
+    pos = np.full(m, -1, dtype=np.int64)
+    method = np.full(m, "unmatched", dtype=object)
+    delta = np.full(m, np.nan)
+    if tp.empty:
+        method[:] = "no_truth"
+        return pos, method, delta
 
-    pointers: list[tuple[int, int, str, float]] = []  # (pos, truth_pos, method, delta_ms)
-    used: set[int] = set()
+    have_addr = tp["_addr"].notna().any()
+    t_addr = tp["_addr"].fillna("").to_numpy(dtype=object) if have_addr \
+        else np.full(len(tp), "", dtype=object)
+    t_flow = tp["_flow"].to_numpy(dtype=object)
+    t_seq = pd.to_numeric(tp["notification.seq"], errors="coerce").to_numpy()
+    t_ts = tp["_ts_epoch"].to_numpy(dtype="float64")
+    used = np.zeros(len(tp), dtype=bool)
 
-    if "bin_handshake_packet_type" in truth.columns:
-        hsfull = truth[truth["bin_handshake_packet_type"].notna()]
-    else:
-        hsfull = truth.iloc[0:0]
-    hs_epoch = hsfull["_bin_ts_epoch"].to_numpy(dtype="float64")
-    hs_pos = hsfull.index.to_numpy(dtype="int64")
+    w_addr = wire["client_addr"].to_numpy(dtype=object) if have_addr \
+        else np.full(m, "", dtype=object)
+    w_flow = wire["flow"].to_numpy(dtype=object)
+    w_seq = pd.to_numeric(wire["wire_seq"], errors="coerce").to_numpy()
+    w_ts = pd.to_numeric(wire["timestamp"], errors="coerce").to_numpy()
+    w_hs = _truthy(wire["wire_is_handshake"])
+    method[w_hs] = "handshake"
 
-    for axis in ("cs", "sc"):
-        wm = wire["flow"].fillna("") == axis
-        positions = wire.index[wm].to_numpy(dtype="int64")
-        if not positions.size:
+    seq_index: dict[tuple, list[int]] = {}
+    for g in np.flatnonzero(~np.isnan(t_seq)):
+        seq_index.setdefault((t_addr[g], t_flow[g], int(t_seq[g])), []).append(int(g))
+
+    # Pass 1: exact seq.
+    for i in np.flatnonzero(~w_hs & ~np.isnan(w_seq) & ~np.isnan(w_ts)):
+        best, best_dt = -1, seq_window_s
+        for g in seq_index.get((w_addr[i], w_flow[i], int(w_seq[i])), ()):
+            dt = abs(t_ts[g] - w_ts[i])
+            if not used[g] and dt <= best_dt:
+                best, best_dt = g, dt
+        if best >= 0:
+            used[best] = True
+            pos[i], method[i], delta[i] = best, "seq", best_dt * 1000.0
+
+    # Pass 2: nearest unused row of the same client + direction.
+    groups: dict[tuple, np.ndarray] = {}
+    for key, idx in pd.DataFrame({"a": t_addr, "f": t_flow}).groupby(
+            ["a", "f"], sort=False).indices.items():
+        idx = np.asarray(idx)
+        groups[key] = idx[np.argsort(t_ts[idx], kind="stable")]
+    for i in np.flatnonzero((pos < 0) & ~w_hs & ~np.isnan(w_ts)):
+        idx = groups.get((w_addr[i], w_flow[i]))
+        if idx is None:
             continue
-        dir_col = "bin_incoming" if axis == "cs" else "bin_outgoing"
-        t = truth[_as_bool(truth[dir_col])]
+        ts = t_ts[idx]
+        k = int(np.searchsorted(ts, w_ts[i]))
+        lo, hi, best, best_dt = k - 1, k, -1, time_window_s
+        while lo >= 0 and w_ts[i] - ts[lo] <= best_dt:
+            if not used[idx[lo]]:
+                best, best_dt = int(idx[lo]), w_ts[i] - ts[lo]
+                break
+            lo -= 1
+        while hi < len(ts) and ts[hi] - w_ts[i] <= best_dt:
+            if not used[idx[hi]]:
+                best, best_dt = int(idx[hi]), ts[hi] - w_ts[i]
+                break
+            hi += 1
+        if best >= 0:
+            used[best] = True
+            pos[i], method[i], delta[i] = best, "time", best_dt * 1000.0
+    return pos, method, delta
 
-        if t.empty:
-            pointers.extend((int(p), -1, "unmatched", np.nan) for p in positions)
-            continue
 
-        seq_map: dict[int, list[int]] = {}
-        for s, gi in zip(
-            t["bin_notif_seq"].to_numpy(dtype="float64"), t.index.to_numpy(dtype="int64")
-        ):
-            if not pd.isna(s):
-                seq_map.setdefault(int(s), []).append(int(gi))
-        epoch = t["_bin_ts_epoch"].to_numpy(dtype="float64")
-        t_gpos = t.index.to_numpy(dtype="int64")
+# ----------------------------------------------------------------------------
+# Per-pcap assembly
+# ----------------------------------------------------------------------------
 
-        pos_to_slot = {int(g): int(i) for i, g in enumerate(t_gpos)}
-        epoch_by_g = {g: epoch[pos_to_slot[g]] for g in t_gpos}
+def build_packets(df: pd.DataFrame, truth: pd.DataFrame | None, ident: Identity | None,
+                  iv: pd.DataFrame | None, a) -> pd.DataFrame:
+    wire = df[list(WIRE_DEF)].rename(columns=WIRE_DEF).reset_index(drop=True)
+    wire["client_addr"] = wire["client_ip"].astype(str) + ":" + wire["client_port"].astype(str)
+    w_ts = pd.to_numeric(wire["timestamp"], errors="coerce").to_numpy()
 
-        def in_window(cands: list[int], wts: float) -> list[tuple[int, float]]:
-            return [
-                (g, abs(epoch_by_g[g] - wts) * 1000.0)
-                for g in cands
-                if g not in used and abs(epoch_by_g[g] - wts) <= window_s
-            ]
+    if truth is None:
+        out = wire
+        out["join_method"] = "no_truth"
+        out["join_delta_ms"] = np.nan
+        return _canonicalize(out, PACKET_OUT_COLS)
 
-        for pos in positions:
-            row = wire.loc[pos]
-            wseq = row.get("wire_seq")
-            wack = row.get("wire_acked_seq")
-            wts = row.get("timestamp")
+    tp = truth[truth["entry_type"] == "packet"].reset_index(drop=True)
+    tp["_addr"] = ident.truth_addr(tp)
+    tp["_flow"] = np.where(_truthy(_col(tp, "incoming")), "cs", "sc")
+    pos, method, delta = join_truth(wire, tp, a.seq_window_s, a.match_window_ms / 1000.0)
 
-            if pd.isna(wts):
-                pointers.append((int(pos), -1, "unmatched", np.nan))
-                continue
+    tsel = tp.reindex(columns=list(PKT_TRUTH_RENAME)).rename(columns=PKT_TRUTH_RENAME)
+    pad = pd.DataFrame([[np.nan] * tsel.shape[1]], columns=tsel.columns)
+    tsel = pd.concat([tsel, pad], ignore_index=True).iloc[np.where(pos < 0, len(tp), pos)]
+    out = pd.concat([wire, tsel.reset_index(drop=True)], axis=1)
+    out["join_method"] = method
+    out["join_delta_ms"] = delta
 
-            best: tuple[int, str, float] | None = None
-            if not pd.isna(wseq):
-                cands = in_window(seq_map.get(int(wseq), []), float(wts))
-                if cands:
-                    g, dms = min(cands, key=lambda x: x[1])
-                    best = (g, "seq", dms)
-            if best is None and not pd.isna(wack):
-                cands = in_window(seq_map.get(int(wack), []), float(wts))
-                if cands:
-                    g, dms = min(cands, key=lambda x: x[1])
-                    best = (g, "acked_seq", dms)
-            if best is None:
-                dt = np.abs(epoch - float(wts))
-                j = int(np.argmin(dt))
-                g = int(t_gpos[j])
-                if dt[j] <= window_s and g not in used:
-                    best = (g, "time", float(dt[j]) * 1000.0)
+    addrs = out["client_addr"].to_numpy(dtype=object)
+    out["address_id"] = [ident.id_by_addr.get(x, np.nan) for x in addrs]
+    pid, how = ident.players_for(addrs, w_ts)
+    out["player_id"] = pid
+    out["player_name"] = [ident.names.get(int(p), "") if not np.isnan(p) else ""
+                          for p in pid]
+    out["player_map_method"] = how
+    for k, v in label_cheats(pid, w_ts, iv).items():
+        out[k] = v
 
-            if best is not None:
-                g, method, dms = best
-                used.add(g)
-                pointers.append((int(pos), g, method, dms))
-            else:
-                pointers.append((int(pos), -1, "unmatched", np.nan))
+    # Truth logs bunches only for incoming (cs) packets; compare against its
+    # channel bunches (actor + control), not the RPC/movement annotations.
+    wb = pd.to_numeric(out["wire_bunch_count"], errors="coerce")
+    tb = pd.to_numeric(out["bin_channel_bunch_count"], errors="coerce")
+    out["wire_bin_bunch_count_diff"] = (wb - tb).where(out["flow"] == "cs")
+    return _canonicalize(out, PACKET_OUT_COLS)
 
-    # Handshake-only packets (no seq yet) -> nearest handshake row in time.
-    hsmask = wire["wire_is_handshake"].fillna(False).astype(bool)
-    handled = {p[0] for p in pointers}
-    for pos in wire.index[hsmask].to_numpy(dtype="int64"):
-        if pos in handled:
-            continue
-        wts = wire.at[pos, "timestamp"]
-        if hs_epoch.size == 0 or pd.isna(wts):
-            pointers.append((int(pos), -1, "unmatched", np.nan))
-            continue
-        dt = np.abs(hs_epoch - float(wts))
-        j = int(np.argmin(dt))
-        if dt[j] <= window_s:
-            pointers.append((int(pos), int(hs_pos[j]), "time", float(dt[j]) * 1000.0))
-        else:
-            pointers.append((int(pos), -1, "unmatched", np.nan))
 
-    # Any wire row with no pointer (e.g. dropped frames) -> unmatched.
-    have = {p[0] for p in pointers}
-    for pos in wire.index.to_numpy(dtype="int64"):
-        if pos not in have:
-            pointers.append((int(pos), -1, "unmatched", np.nan))
+def build_bunches(bunch_df: pd.DataFrame, packets: pd.DataFrame) -> pd.DataFrame:
+    """Attach each wire bunch to its parent packet's context."""
+    bunch = bunch_df.rename(columns={k: v for k, v in BUNCH_RENAME.items()
+                                     if k in bunch_df.columns})
+    ctx_cols = [c for c in BUNCH_PKT_COLS if c in packets.columns]
+    ctx = packets[ctx_cols].drop_duplicates(subset=["file", "packet_no"])
+    ctx = ctx.assign(packet_no=pd.to_numeric(ctx["packet_no"], errors="coerce"))
+    bunch = bunch.assign(packet_no=pd.to_numeric(bunch["packet_no"], errors="coerce"))
+    keep = [c for c in bunch.columns if c not in ctx_cols or c in ("file", "packet_no")]
+    merged = bunch[keep].merge(ctx, on=["file", "packet_no"], how="left")
+    return _canonicalize(merged, BUNCH_OUT_COLS)
 
-    pf = pd.DataFrame(
-        pointers, columns=["pos", "truth_pos", "method", "delta_ms"]
-    ).sort_values("pos").drop_duplicates(subset="pos", keep="first")
 
-    pad = pd.DataFrame([[np.nan] * len(truth.columns)], columns=truth.columns)
-    tball = pd.concat([truth, pad], ignore_index=True)
-    pad_pos = len(truth)
-    sel = np.where(pf["truth_pos"].values < 0, pad_pos, pf["truth_pos"].values)
+def _list_join(v) -> str:
+    return ";".join(str(x) for x in v) if isinstance(v, (list, tuple)) else ""
 
-    wire_sel = wire.iloc[pf["pos"].to_numpy(dtype="int64")].reset_index(drop=True)
-    truth_sel = tball.iloc[sel].reset_index(drop=True)
-    truth_sel = truth_sel.drop(columns=["_bin_ts_epoch"], errors="ignore")
 
-    merged = pd.concat([wire_sel, truth_sel], axis=1)
-    merged["join_method"] = pf["method"].values
-    merged["join_delta_ms"] = pf["delta_ms"].values
-    return merged
+def extract_events(truth: pd.DataFrame, ident: Identity, iv: pd.DataFrame) -> pd.DataFrame:
+    """Truth event rows with resolved actor and cheat label."""
+    ev = truth[truth["entry_type"] == "event"].reset_index(drop=True)
+    if ev.empty:
+        return ev
+    out = ev.reindex(columns=list(EVENT_RENAME)).rename(columns=EVENT_RENAME)
+    loc = _col(ev, "movement.new_location")
+    for i, axis in enumerate("xyz"):
+        out[f"bin_movement_loc_{axis}"] = loc.map(
+            lambda v, i=i: v[i] if isinstance(v, (list, tuple)) and len(v) > i else np.nan)
+    out["bin_movement_rot"] = _col(ev, "movement.new_rotation").map(_list_join)
+    vis = _col(ev, "weapon.visible_players")
+    out["bin_weapon_visible_players"] = vis.map(_list_join)
+    out["bin_weapon_visible_count"] = vis.map(
+        lambda v: len(v) if isinstance(v, (list, tuple)) else np.nan)
+
+    actor = pd.Series(np.nan, index=ev.index)
+    for c in ACTOR_COLS:
+        actor = actor.fillna(pd.to_numeric(_col(ev, c), errors="coerce"))
+    pid = actor.to_numpy(dtype="float64")
+    t = ev["_ts_epoch"].to_numpy(dtype="float64")
+    out["actor_player_id"] = pid
+    out["actor_name"] = [ident.names.get(int(p), "") if not np.isnan(p) else "" for p in pid]
+    out["actor_addr"] = ident.addr_of_player(pid, t)
+    for k, v in label_cheats(pid, t, iv).items():
+        out[k] = v
+    return _canonicalize(out, EVENT_OUT_COLS)
+
+
+def _append_csv(df: pd.DataFrame, path: Path) -> None:
+    df.to_csv(path, mode="a", index=False,
+              header=not path.exists() or path.stat().st_size == 0)
+
+
+def _report(pk: pd.DataFrame) -> None:
+    flow = pk["flow"]
+    jm = pd.crosstab(flow, pk["join_method"])
+    print("    join methods by flow:\n      " + jm.to_string().replace("\n", "\n      "))
+    err = pk["wire_bunch_parse_error"].astype(str).ne("") | pk["wire_short_packet"].astype(str).eq("True")
+    bc = pd.to_numeric(pk["wire_bunch_count"], errors="coerce")
+    for f in ("cs", "sc"):
+        m = flow == f
+        print(f"    {f}: bunch errors {int(err[m].sum()):,}/{int(m.sum()):,}, "
+              f"wire bunches/pkt {bc[m].mean():.3f}")
+    diff = pd.to_numeric(pk["wire_bin_bunch_count_diff"], errors="coerce").dropna()
+    if len(diff):
+        print(f"    cs wire-vs-truth bunch count: equal {(diff == 0).mean():.1%}, "
+              f"mean diff {diff.mean():+.3f}")
+    print("    player_map_method:", pk["player_map_method"].value_counts().to_dict())
 
 
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description="Map pcap packet fields onto the .bin-derived ground-truth CSV."
-    )
+        description="Map pcap packet fields onto the dataset's server ground truth.")
     p.add_argument("inputs", nargs="+",
                    help="pcap file(s), directories (recursively scanned) or glob patterns")
     p.add_argument("--output", default=DEFAULT_OUTPUT,
                    help="output packet CSV (default: %(default)s)")
     p.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT,
                    help="UDP server port identifying the flows (default: %(default)s)")
-    p.add_argument("--truth", default=str(DEFAULT_TRUTH),
-                   help="ground-truth CSV (default: %(default)s)")
+    p.add_argument("--truth-source", choices=("auto", "bin", "csv"), default="auto",
+                   help="ground truth format next to each pcap: .bin via "
+                        "ParserProtobufLogs, .csv via pandas, or auto "
+                        "(.bin when parseable, else .csv) (default: %(default)s)")
+    p.add_argument("--truth", default=None,
+                   help="explicit trace .bin/.csv (only with a single pcap); "
+                        "default: the trace next to each pcap")
+    p.add_argument("--seq-window-s", type=float, default=2.0,
+                   help="max |time delta| for an exact seq match (default: %(default)s)")
     p.add_argument("--match-window-ms", type=float, default=50.0,
-                   help="time-window used for the fallback join (default: %(default)s)")
-    p.add_argument("--no-bunches", action="store_true",
-                   help="skip the bunch-level output CSV")
-    p.add_argument("--no-events", action="store_true",
-                   help="skip the event-label output CSV")
+                   help="time window for the nearest-time fallback (default: %(default)s)")
+    p.add_argument("--no-bunches", action="store_true", help="skip the bunch CSV")
+    p.add_argument("--no-events", action="store_true", help="skip the event CSV")
     a = p.parse_args(argv)
-
-    truth_path = Path(a.truth)
-    if not truth_path.exists():
-        print(f"Ground truth not found: {truth_path}")
-        return 1
 
     pcaps = discover_files(a.inputs)
     if not pcaps:
         print(f"No .pcap files found under {a.inputs}")
         return 1
+    if a.truth and len(pcaps) != 1:
+        print("--truth can only be used with a single pcap")
+        return 1
     print(f"Found {len(pcaps)} pcap file(s)")
 
-    # --- locate ground-truth rows ----------------------------------------
-    print("Indexing ground truth...", flush=True)
-    index, run_order = index_truth(truth_path)
-    resolution = resolve_truth_files(pcaps, index)
-    needed = {f for f in resolution.values()}
-    print(f"resolved {len(needed)} ground-truth bin(s): {sorted(needed)}")
-
-    # --- process pcaps, streaming ground truth run-by-run ------------------
     out = Path(a.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     bunch_out = out.with_name(out.stem + "_bunches.csv")
@@ -551,132 +589,51 @@ def main(argv: list[str] | None = None) -> None:
         path.unlink(missing_ok=True)
 
     adaptor = PcapAdaptor(server_port=a.server_port)
-    totals = {"packets": 0, "bunches": 0, "events": 0, "handshake": 0, "data": 0, "errors": 0}
-    methods_total = {"seq": 0, "acked_seq": 0, "time": 0, "unmatched": 0, "no_truth": 0}
-    events_written: set[str] = set()
-
-    run_pos = {f: i for i, f in enumerate(run_order)}
-    pcaps_ordered = sorted(
-        pcaps, key=lambda p: run_pos.get(resolution.get(str(p), ""), 10**9)
-    )
-    n = 0
+    totals = {"packets": 0, "bunches": 0, "events": 0, "errors": 0}
     start_all = time.monotonic()
 
-    def run_one(pcap: Path, text_file: str | None,
-                truth: pd.DataFrame | None) -> None:
-        nonlocal n
-        n += 1
-        pcap_s = str(pcap)
-        print(f"[{n}/{len(pcaps)}] {pcap_s} -> truth '{text_file or 'NONE'}'", flush=True)
+    for n, pcap in enumerate(pcaps, start=1):
         t0 = time.monotonic()
+        trace = Path(a.truth) if a.truth else find_truth(pcap)
+        truth = ident = iv = None
+        if trace is None:
+            print(f"[{n}/{len(pcaps)}] {pcap}: WARNING no trace_* ground truth next to it")
+        else:
+            try:
+                truth, used = load_truth(trace, a.truth_source)
+                ident, iv = Identity(truth), cheat_intervals(truth)
+                print(f"[{n}/{len(pcaps)}] {pcap} -> {trace.name} ({used}, "
+                      f"{len(truth):,} rows, {len(iv)} cheat intervals)", flush=True)
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"[{n}/{len(pcaps)}] {pcap}: WARNING cannot load truth: {exc}")
+
         df, bunch_df, counts = adaptor.process_file(pcap)
-
-        wire = df[list(WIRE_DEF)].rename(columns=WIRE_DEF)
-        merged = (
-            join_truth(wire, truth, a.match_window_ms / 1000.0)
-            if truth is not None else _no_truth_frame(wire)
-        )
-        merged = _canonicalize(merged, PACKET_OUT_COLS)
-
-        for m in ("seq", "acked_seq", "time", "unmatched", "no_truth"):
-            methods_total[m] += int((merged["join_method"] == m).sum())
-
-        merged.to_csv(out, mode="a", index=False,
-                      header=(n == 1 or out.stat().st_size == 0))
-
-        bunch_written = False
-        if not a.no_bunches and bunch_df is not None and not bunch_df.empty:
-            b = _build_bunches(bunch_df, merged)
-            if not b.empty:
-                b.to_csv(bunch_out, mode="a", index=False,
-                         header=(not bunch_out.exists() or bunch_out.stat().st_size == 0))
-                bunch_written = True
-
-        events_written_flag = False
-        if (
-            not a.no_events
-            and truth is not None
-            and text_file not in events_written
-        ):
-            ev = extract_events(truth)
+        packets = build_packets(df, truth, ident, iv, a)
+        _append_csv(packets, out)
+        if not a.no_bunches and not bunch_df.empty:
+            _append_csv(build_bunches(bunch_df, packets), bunch_out)
+        if not a.no_events and truth is not None:
+            ev = extract_events(truth, ident, iv)
             if not ev.empty:
-                ev.to_csv(events_out, mode="a", index=False,
-                          header=(not events_out.exists() or events_out.stat().st_size == 0))
+                _append_csv(ev, events_out)
                 totals["events"] += len(ev)
-                events_written.add(text_file)
-                events_written_flag = True
 
-        for k in counts:
+        for k in ("packets", "bunches", "errors"):
             totals[k] += counts[k]
-        dt = time.monotonic() - t0
         print(f"    {counts['packets']:,} packets, {counts['bunches']:,} bunches "
-              f"({dt:.1f}s); bunches-csv:{'yes' if bunch_written else 'no'}"
-              f" events-csv:{'yes' if events_written_flag else 'no'}", flush=True)
-        del df, merged
-        if "bunch_df" in locals():
-            del bunch_df
-
-    delivered: set[str] = set()
-    if needed:
-        print("Streaming ground-truth runs...", flush=True)
-        for f, truth in iter_truth_runs(truth_path, needed):
-            delivered.add(f)
-            for pcap in (p for p in pcaps_ordered if resolution.get(str(p)) == f):
-                run_one(pcap, f, truth)
-            del truth
-
-    for pcap in pcaps_ordered:
-        f = resolution.get(str(pcap))
-        if f is None or f not in delivered:
-            run_one(pcap, None, None)
+              f"({time.monotonic() - t0:.1f}s)", flush=True)
+        _report(packets)
+        del df, bunch_df, packets, truth
 
     print(f"\nProcessed {len(pcaps)} pcap(s): {totals['packets']:,} packets, "
-          f"{totals['bunches']:,} bunches, {totals['errors']:,} errors "
-          f"in {time.monotonic()-start_all:.0f}s")
-    print("Join methods:", methods_total)
+          f"{totals['bunches']:,} bunches, {totals['errors']:,} decode errors "
+          f"in {time.monotonic() - start_all:.0f}s")
     print(f"Wrote {out}")
-    if not a.no_bunches and bunch_out.exists():
+    if bunch_out.exists():
         print(f"Wrote {bunch_out}")
-    if not a.no_events and events_out.exists():
+    if events_out.exists():
         print(f"Wrote {events_out} ({totals['events']:,} event rows)")
     return 0
-
-
-def _no_truth_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """Wire rows with no ground truth: blank truth fields + no_truth method."""
-    out = df.copy()
-    out["join_method"] = "no_truth"
-    out["join_delta_ms"] = np.nan
-    return out
-
-
-def extract_events(truth: pd.DataFrame) -> pd.DataFrame:
-    """Event-type ground-truth rows (movement/weapon/health/cheat/phase)."""
-    if "bin_entry_type" not in truth.columns:
-        return pd.DataFrame()
-    ev = truth[truth["bin_entry_type"].astype(str) == "event"]
-    if ev.empty:
-        return ev
-    return _canonicalize(ev, EVENT_OUT_COLS)
-
-
-def _build_bunches(bunch_df: pd.DataFrame, merged: pd.DataFrame) -> pd.DataFrame:
-    """Attach each wire bunch to its parent packet's join context."""
-    bunch = bunch_df.copy()
-    bunch = bunch.rename(columns={k: v for k, v in BUNCH_RENAME.items() if k in bunch.columns})
-    keep_pkt = [c for c in BUNCH_PKT_COLS if c in merged.columns]
-    ctx = merged[keep_pkt].drop_duplicates(subset=["file", "packet_no"])
-    for target in (bunch, ctx):
-        target["packet_no"] = pd.to_numeric(target["packet_no"], errors="coerce").astype("Int64")
-    merged_local = bunch.merge(ctx, on=["file", "packet_no"], how="left", suffixes=("", "_y"))
-    for c in BUNCH_PKT_COLS:
-        if c + "_y" in merged_local.columns:
-            merged_local[c] = merged_local[c + "_y"].fillna(merged_local[c])
-            merged_local = merged_local.drop(columns=[c + "_y"])
-    for c in BUNCH_FIELD_COLS:
-        if c in bunch.columns and c not in merged_local.columns:
-            merged_local[c] = bunch[c]
-    return _canonicalize(merged_local, BUNCH_OUT_COLS)
 
 
 if __name__ == "__main__":

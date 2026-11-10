@@ -31,6 +31,7 @@ from net.handlers.stateless_connect import (
     HandshakePacketType,
 )
 from net.connection import NetConnection
+from net.channels.channel_types import EChannelCloseReason
 from net.error_reporter import PARSE_EXCEPTIONS
 from app_config import LOCAL_NETWORK_VERSION
 
@@ -102,6 +103,9 @@ BUNCH_COLUMNS = [c for c in PACKET_COLUMNS if c != "payload_hex"] + [
     "has_package_map_exports",
     "has_must_be_mapped_guids",
     "payload_bits",
+    "close_reason",
+    "is_replication_paused",
+    "partial_custom_exports_final",
 ]
 
 
@@ -134,8 +138,22 @@ class PcapAdaptor:
         # server, each with its own sequence space — mixing them corrupts
         # reliable-sequence/channel tracking.
         self._connections: dict[tuple, NetConnection] = {}
+        # Channel name per (connection key, channel index). UE only sends the
+        # channel name on open/reliable bunches, so later bunches inherit it.
+        self._ch_names: dict[tuple, str] = {}
         self._client_id: int | None = None
         self._network_version: int | None = None
+
+    def reset(self) -> None:
+        """Drop all per-capture decoder state (connections, ids, channels)."""
+        self._connections = {}
+        self._ch_names = {}
+        self._client_id = None
+        self._network_version = None
+        self._stateless = StatelessConnectHandlerComponent(
+            CachedClientID=0,
+            LocalNetworkVersion=LOCAL_NETWORK_VERSION,
+        )
 
     @staticmethod
     def _client_key(to_server: bool, ip: str, port: int) -> tuple:
@@ -218,7 +236,7 @@ class PcapAdaptor:
             packet_reader = FBitReader(inner_data, num_bits=inner_bits)
 
             conn = self._get_conn(key)
-            info.update(self._decode_packet(conn, packet_reader))
+            info.update(self._decode_packet(conn, packet_reader, key))
             return info
 
         except PARSE_EXCEPTIONS as exc:
@@ -258,7 +276,9 @@ class PcapAdaptor:
             "client_id": hs.CachedClientID or None,
         }
 
-    def _decode_packet(self, conn: NetConnection, reader: FBitReader) -> dict:
+    def _decode_packet(
+        self, conn: NetConnection, reader: FBitReader, key: tuple
+    ) -> dict:
         info: dict = {
             "is_handshake": False,
             "bunch_count": 0,
@@ -287,7 +307,11 @@ class PcapAdaptor:
                     info["jitter_clock_ms"] = reader.read_int(1024)
                     b_has_frame = reader.read_bit()
                     info["has_server_frame_time"] = b_has_frame
-                    if b_has_frame:
+                    # UNetConnection::WritePacketInfo only appends the frame
+                    # time byte when the *server* writes. On client->server
+                    # packets the bit is merely the client's request flag and
+                    # no byte follows; reading one misaligns every bunch.
+                    if b_has_frame and key[0] == "sc":
                         info["server_frame_time"] = reader.serialize_bits(8)[0]
             except BitReaderError:
                 # Short packet: packet-info extends past the end of data.
@@ -305,7 +329,12 @@ class PcapAdaptor:
                 bunch = conn._parse_bunch_header(reader)
                 conn._read_bunch_payload(reader, bunch)
                 bunch_count += 1
-                info["bunches"].append(self._bunch_to_dict(bunch))
+                info["bunches"].append(self._bunch_to_dict(bunch, key))
+                if bunch.bReliable:
+                    # Advance the reference so the next relative ChSequence
+                    # resolves against this one (the live client does this
+                    # when the channel consumes the bunch).
+                    conn.in_reliable[bunch.ChIndex] = bunch.ChSequence
         except PARSE_EXCEPTIONS as exc:
             info["bunch_parse_error"] = f"{type(exc).__name__}: {exc}"
 
@@ -315,12 +344,25 @@ class PcapAdaptor:
         )
         return info
 
-    @staticmethod
-    def _bunch_to_dict(bunch) -> dict:
+    def _bunch_to_dict(self, bunch, key: tuple) -> dict:
         name = getattr(bunch, "ChName", None)
+        name = getattr(name, "name", None) if name is not None else None
+        ch_key = (key, bunch.ChIndex)
+        if name and name != "None_":
+            self._ch_names[ch_key] = name
+        else:
+            name = self._ch_names.get(ch_key)
+        if bunch.bClose:
+            self._ch_names.pop(ch_key, None)
+        close_reason = getattr(bunch, "CloseReason", None) if bunch.bClose else None
+        if isinstance(close_reason, int):
+            try:
+                close_reason = EChannelCloseReason(close_reason)
+            except ValueError:
+                pass
         return {
             "ch_index": bunch.ChIndex,
-            "ch_name": getattr(name, "name", None) if name is not None else None,
+            "ch_name": name,
             "reliable": bunch.bReliable,
             "open": bunch.bOpen,
             "close": bunch.bClose,
@@ -331,6 +373,11 @@ class PcapAdaptor:
             "has_package_map_exports": bunch.bHasPackageMapExports,
             "has_must_be_mapped_guids": bunch.bHasMustBeMappedGUIDs,
             "payload_bits": bunch.num_bits if hasattr(bunch, "num_bits") else 0,
+            "close_reason": getattr(close_reason, "name", close_reason),
+            "is_replication_paused": getattr(bunch, "bIsReplicationPaused", False),
+            "partial_custom_exports_final": getattr(
+                bunch, "bPartialCustomExportsFinal", False
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -350,11 +397,16 @@ class PcapAdaptor:
         packet_no = 0
         self._rows = []
         self._bunch_rows = []
+        # Each capture is an independent session: never carry connection,
+        # channel or handshake state over from a previous file.
+        self.reset()
 
         # UDP/IP packets captured for the server flow, buffered then processed
         # in strict chronological order (pcap files can contain reordered
         # packets, which would corrupt stateful sequence/channel parsing).
-        captured: list[tuple[float, object]] = []
+        # Only the needed fields are kept (not the scapy objects, which cost
+        # several KB each and dominated peak memory).
+        captured: list[tuple] = []
 
         with PcapReader(str(pcap_path)) as packets:
             for pkt in packets:
@@ -364,36 +416,34 @@ class PcapAdaptor:
                 dport = pkt[UDP].dport
                 if self.server_port not in (sport, dport):
                     continue
-                captured.append((float(pkt.time), pkt))
+                ip = pkt[IP]
+                captured.append((
+                    float(pkt.time), ip.src, ip.dst, sport, dport, ip.ttl,
+                    len(pkt), bytes(pkt[UDP].payload),
+                ))
 
         captured.sort(key=lambda t: t[0])
 
-        for _, pkt in captured:
+        for ts, src, dst, sport, dport, ttl, length, payload in captured:
             packet_no += 1
 
-            sport = pkt[UDP].sport
-            dport = pkt[UDP].dport
             to_server = dport == self.server_port
-            payload = bytes(pkt[UDP].payload)
-
-            key = self._client_key(
-                to_server, pkt[IP].src, sport if to_server else dport
-            )
+            key = self._client_key(to_server, src, sport if to_server else dport)
             decoded = self._decode(payload, to_server, key)
 
             base = {
                 "file": file_name,
                 "packet_no": packet_no,
-                "timestamp": float(pkt.time),
-                "src_ip": pkt[IP].src,
-                "dst_ip": pkt[IP].dst,
+                "timestamp": ts,
+                "src_ip": src,
+                "dst_ip": dst,
                 "src_port": sport,
                 "dst_port": dport,
-                "packet_length": len(pkt),
-                "ttl": pkt[IP].ttl,
+                "packet_length": length,
+                "ttl": ttl,
                 "sport": sport,
                 "dport": dport,
-                "client_ip": pkt[IP].src if to_server else pkt[IP].dst,
+                "client_ip": src if to_server else dst,
                 "client_port": sport if to_server else dport,
             }
             base.update(decoded)
