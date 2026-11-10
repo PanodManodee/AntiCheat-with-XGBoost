@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bot Console</title>
+<style>
+*{box-sizing:border-box;margin:0}
+:root{
+  --bg:#101218;--border:#262b38;
+  --text:#e2e5ec;--dim:#8890a0;--accent:#5b9bff;
+  --green:#4ade80;--red:#f87171;
+  --mono:"JetBrains Mono","Fira Code","SF Mono","Consolas",monospace;
+}
+html,body{height:100%}
+body{
+  display:flex;flex-direction:column;
+  background:var(--bg);color:var(--text);
+}
+.log{
+  flex:1;overflow-y:auto;padding:18px 20px;
+  font-family:var(--mono);font-size:14px;line-height:1.7;
+  color:var(--dim);white-space:pre-wrap;word-break:break-all;
+}
+.log .ts{color:#4a5068}
+.log .cmd{color:var(--accent)}
+.log .ok{color:var(--green)}
+.log .err{color:var(--red)}
+.input-row{
+  display:flex;border-top:1px solid var(--border);flex-shrink:0;
+}
+.prompt{
+  padding:0 0 0 20px;display:flex;align-items:center;
+  font-family:var(--mono);font-size:15px;color:var(--accent);
+  user-select:none;flex-shrink:0;
+}
+.input-row input{
+  flex:1;background:transparent;border:0;outline:0;
+  font-family:var(--mono);font-size:15px;color:var(--text);
+  padding:16px 10px;
+}
+.input-row input::placeholder{color:var(--dim);opacity:.5}
+.input-row button{
+  background:transparent;border:0;color:var(--dim);
+  padding:0 18px;cursor:pointer;font-size:16px;
+  transition:color .15s;flex-shrink:0;
+}
+.input-row button:hover{color:var(--accent)}
+.quick{
+  display:flex;gap:8px;padding:10px 20px;border-top:1px solid var(--border);
+  flex-wrap:wrap;align-items:center;flex-shrink:0;
+}
+.dot{
+  width:9px;height:9px;border-radius:50%;background:var(--dim);
+  transition:background .3s;flex-shrink:0;
+}
+.dot.ok{background:var(--green)}.dot.bad{background:var(--red)}
+.quick button{
+  background:transparent;border:1px solid var(--border);border-radius:6px;
+  padding:6px 12px;font-family:var(--mono);font-size:13px;
+  color:var(--dim);cursor:pointer;transition:all .15s;
+}
+.quick button:hover{color:var(--text);border-color:#3a4158}
+</style>
+</head>
+<body>
+<div id="log" class="log"></div>
+<div class="input-row">
+  <div class="prompt">&gt;</div>
+  <input id="cmd" type="text" placeholder='move fx="500*sin(t)" duration=5' spellcheck="false" autocomplete="off">
+  <button id="send" type="button" title="Send">&#9654;</button>
+</div>
+<div class="quick">
+  <div id="dot" class="dot" title="health"></div>
+  <button data-cmd="move status">move status</button>
+  <button data-cmd="move stop">move stop</button>
+  <button data-cmd='move fx="400*sin(2*pi*t/6)" fy="400*cos(2*pi*t/6)" duration=6'>circle</button>
+  <button data-cmd='move fx="500" duration=3'>forward</button>
+  <button data-cmd='nick Bot'>nick</button>
+</div>
+<script>
+const dot=document.getElementById("dot"),
+      log=document.getElementById("log"),
+      cmd=document.getElementById("cmd"),
+      send=document.getElementById("send");
+
+const history=[];
+let hIdx=-1;
+
+function ts(){return new Date().toLocaleTimeString("en-GB",{hour12:false})}
+
+function append(html){
+  log.innerHTML+=html+"\n";
+  log.scrollTop=log.scrollHeight;
+}
+
+async function exec(c){
+  if(!c||!c.trim())return;
+  c=c.trim();
+  if(!history.length||history[history.length-1]!==c)history.push(c);
+  hIdx=history.length;
+  try{
+    const r=await fetch("/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:c})});
+    const b=await r.json().catch(()=>({}));
+    append(`<span class="ts">${ts()}</span> <span class="cmd">${esc(c)}</span> <span class="${b.ok?"ok":"err"}">${b.ok?"queued":"error"}</span>`);
+  }catch(e){
+    append(`<span class="ts">${ts()}</span> <span class="cmd">${esc(c)}</span> <span class="err">${esc(String(e))}</span>`);
+  }
+}
+
+function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+
+send.onclick=()=>{exec(cmd.value);cmd.focus();cmd.select()};
+cmd.onkeydown=e=>{
+  if(e.key==="Enter"){e.preventDefault();exec(cmd.value);cmd.select()}
+  else if(e.key==="ArrowUp"&&history.length){e.preventDefault();hIdx=Math.max(0,hIdx-1);cmd.value=history[hIdx]||""}
+  else if(e.key==="ArrowDown"&&history.length){e.preventDefault();hIdx=Math.min(history.length,hIdx+1);cmd.value=history[hIdx]||""}
+};
+document.querySelectorAll("[data-cmd]").forEach(b=>b.onclick=()=>{cmd.value=b.dataset.cmd;exec(b.dataset.cmd)});
+
+async function health(){
+  try{const r=await fetch("/health",{cache:"no-store"});dot.className="dot "+(r.ok?"ok":"bad")}
+  catch(_){dot.className="dot bad"}
+}
+health();setInterval(health,3000);
+
+const es=new EventSource("/logs");
+es.onmessage=e=>{
+  const msg=JSON.parse(e.data);
+  append(`<span class="ts">${ts()}</span> ${esc(msg)}`);
+};
+
+cmd.focus();
+</script>
+</body>
+</html>
