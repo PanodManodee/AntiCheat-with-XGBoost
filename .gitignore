@@ -8,4 +8,5 @@ venv/
 pyrightconfig.json
 parsed_files/
 *.7z
-/UE5_python_client
+/__pycache__
+/session2_parsed
